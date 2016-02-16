@@ -1,0 +1,13 @@
+name = Store Locator
+description = Store Locator is based on Views module.
+core = 7.x
+version = 7.x-1.0
+dependencies[] = ctools
+dependencies[] = views
+dependencies[] = views_load_more
+dependencies[] = addressfield
+dependencies[] = entity
+dependencies[] = geocoder
+dependencies[] = geofield
+dependencies[] = geophp
+dependencies[] = office_hours

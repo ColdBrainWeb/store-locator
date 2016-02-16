@@ -1,0 +1,292 @@
+<?php
+/**
+ * @file
+ * Code for Store Locator.
+ */
+
+/**
+ * Implements hook_ctools_plugin_api().
+ */
+function store_locator_ctools_plugin_api() {
+  list($module, $api) = func_get_args();
+  if ($module == "strongarm" && $api == "strongarm") {
+    return array("version" => "1");
+  }
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function store_locator_views_api() {
+  return array("version" => "3.0");
+}
+
+/**
+ * Implements hook_node_info().
+ */
+function store_locator_node_info() {
+  $items = array(
+    'office_location' => array(
+      'name' => t('Office Location'),
+      'base' => 'node_content',
+      'description' => t('This is used to generate location content for the store locator map.'),
+      'has_title' => '1',
+      'title_label' => t('Title'),
+      'help' => '',
+    ),
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function store_locator_menu() {
+  $items['admin/config/search/office_locator'] = array(
+    'title' => 'Store Locator',
+    'description' => 'Store Locator Settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('store_locator_admin_form'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+    'menu_name' => 'management',
+    'weight' => 1,
+  );
+  return $items;
+}
+
+/**
+ * Create admin form for Google Store Locator.
+ */
+function store_locator_admin_form($form, &$form_state) {
+
+  $form['description'] = array(
+    '#type' => 'item',
+    '#title' => t('Store Locator Administrator Settings'),
+  );
+
+  $form['store_locator']['store_locator_map_lat'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Default Map center point (Latitude)'),
+    '#default_value' => variable_get('store_locator_map_lat', '34.1030032'),
+    '#size' => 5,
+    '#element_validate' => array('element_validate_number'),
+    '#required' => TRUE,
+  );
+  $form['store_locator']['store_locator_map_long'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Default Map center point (Longitude)'),
+    '#default_value' => variable_get('store_locator_map_long', '-118.4104684'),
+    '#size' => 5,
+    '#element_validate' => array('element_validate_number'),
+    '#required' => TRUE,
+  );
+  $form['store_locator']['store_locator_map_zoom'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Default zoom level'),
+    '#default_value' => variable_get('store_locator_map_zoom', '10'),
+    '#size' => 5,
+    '#element_validate' => array('element_validate_integer'),
+    '#description' => t('Enter a value from 0-21 with 0 being the farthest distance from the earth'),
+    '#required' => TRUE,
+  );
+
+  if (module_exists('file')) {
+    $form['store_locator']['store_locator_marker_icon'] = array(
+      '#title' => t('Marker Icon'),
+      '#type' => 'managed_file',
+      '#description' => t('The uploaded image will be displayed as the store location icon in the map.'),
+      '#default_value' => variable_get('store_locator_marker_icon', ''),
+      '#upload_location' => 'public://store_locator_marker_icon/',
+    );
+  }
+  else {
+    $form['store_locator']['store_locator_marker_icon'] = array(
+      '#markup' => '<h6>' . t('To enable the custom marker icon feature please install the file module') . '</h6>',
+    );
+  }
+
+  $form = system_settings_form($form);
+  $form['#submit'][] = 'store_locator_admin_form_submit';
+
+  return $form;
+}
+
+/**
+ * Implements hook_views_pre_render().
+ */
+function store_locator_views_pre_render(&$view) {
+  // Load and pass coordinates to map.
+  if ($view->name == 'store_locator') {
+    // Add Google Maps API javascript.
+    drupal_add_js('//maps.googleapis.com/maps/api/js?sensor=false&libraries=places',
+      array('type' => 'external'));
+
+    // Add custom javascript and CSS
+    drupal_add_js(drupal_get_path('module', 'store_locator') .
+      '/js/store_locator.js');
+    drupal_add_css(drupal_get_path('module', 'store_locator') .
+      '/css/store_locator.css');
+
+
+    // Set defautl map center from module settings.
+    $center_latitude = variable_get('store_locator_map_lat', '34.1030032');
+    $center_longitude = variable_get('store_locator_map_long', '-118.4104684');
+
+    /**
+     * Save responses from google maps in origin table.
+     */
+    if (isset($view->exposed_input['field_geofield_distance']['origin']) &&
+      $view->exposed_input['field_geofield_distance']['origin'] != false) {
+      // Save new coordinates from exposed filters by origin.
+      $origin = trim($view->exposed_input['field_geofield_distance']['origin']);
+
+      $saved_origin = db_select('store_locator_origins', 's')
+        ->fields('s', array('origin', 'json'))
+        ->condition('origin', $origin)
+        ->execute()
+        ->fetchAssoc();
+
+      // Look if we already have this origin in our database.
+      if ($saved_origin) {
+        $location = unserialize($saved_origin['json']);
+      }
+      else {
+        // Request for getting coordinates from origin.
+        $response = drupal_http_request('http://maps.google.com/maps/api/geocode/json?address=' . htmlentities(urlencode($origin)) . '&sensor=false');
+
+        if ($response->code == '200') {
+          $location = drupal_json_decode($response->data);
+
+          if ($location['status'] == 'OK') {
+            db_insert('store_locator_origins')
+              ->fields(array(
+                'origin' => $origin,
+                'json' => serialize($location),
+              ))
+              ->execute();
+          }
+          else {
+            watchdog('store_locator', 'Error with writing in database. Origin: @origin, status: @status', array('@origin' => $origin, '@status' => $location['status']));
+          }
+        }
+      }
+
+      if (!empty($location['results'])) {
+        // Replace data from client location, if it is provided.
+        $center_latitude = $location['results'][0]['geometry']['location']['lat'];
+        $center_longitude = $location['results'][0]['geometry']['location']['lng'];
+      }
+      if (!empty($view->result)) {
+        // Provide new markers on map.
+        $coords = array();
+
+        // Load locations coordinates.
+        foreach ($view->result as $key => $item) {
+          $geo = $item->{'_field_data'}['nid']['entity']->sl_geofield[LANGUAGE_NONE][0];
+          $coords[$key] = array(
+            'lat' => $geo['lat'],
+            'lon' => $geo['lon'],
+          );
+        }
+
+        // Fill array if it is last page.
+        $pager = $view->get_items_per_page();
+        $count = count($coords);
+        if ($coords && $count < $pager) {
+          $coords = array_merge($coords, array_fill($count - 1, $pager - $count, ''));
+        }
+
+        // Pass coordinates to map.
+        drupal_add_js(array(
+          'storeLocatorMap' => array(
+            'coords' => $coords ? $coords : null,
+            'count' => $pager,
+            'page' => !empty($_POST['page']) ? $_POST['page'] : 0,
+          )
+        ), 'setting');
+      }
+      else {
+        drupal_set_message('Couldn\'t find offices here, try to enter another origin');
+      }
+    }
+    $icon_fid = variable_get('store_locator_marker_icon', '');
+    if (!empty($icon_fid)){
+      $icon = file_load($icon_fid);
+      if (!empty($icon)) {
+        $icon_path = file_create_url($icon->uri);
+      }
+      drupal_add_js(array(
+        'storeLocatorMap' => array(
+          'icon' => $icon_path,
+        ),
+      ), 'setting');
+    }
+
+    // Set map center variable.
+    drupal_add_js(array(
+      'storeLocatorMap' => array(
+        'latitude' => $center_latitude,
+        'longitude' => $center_longitude,
+        'zoom' => variable_get('store_locator_map_zoom', '10')
+      ),
+    ), 'setting');
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function store_locator_form_alter(&$form, &$form_state, $form_id) {
+  if ($form['#id'] == 'views-exposed-form-store-locator-page') {
+    $form['submit']['#attributes']['class'][] = 'btn';
+    $form['submit']['#attributes']['class'][] = 'btn-primary';
+    // Add description for geolocation event.
+    $form['field_geofield_distance']['#description'] = t('Click here to send your location');
+  }
+}
+
+/**
+ * Submit callback for store_locator_admin_form.
+ */
+function store_locator_admin_form_submit($form, &$form_state) {
+  if ($form['store_locator']['store_locator_marker_icon']['#default_value'] != 0) {
+    if ($form['store_locator']['store_locator_marker_icon']['#default_value'] != $form_state['values']['store_locator_marker_icon']) {
+      $old_file = file_load($form['store_locator']['store_locator_marker_icon']['#default_value']);
+      file_delete($old_file);
+    }
+  }
+  if ($form_state['values']['store_locator_marker_icon'] != 0) {
+    // Load the file via file.fid.
+    $file = file_load($form_state['values']['store_locator_marker_icon']);
+    // Change status to permanent.
+    $file->status = FILE_STATUS_PERMANENT;
+    // Save.
+    file_save($file);
+    file_usage_add($file, 'store_locator', 'store_locator', $file->fid);
+  }
+}
+
+/**
+ * Form validator for store_locator_admin_form.
+ */
+function store_locator_admin_form_validate($form, &$form_state) {
+  // Check that map zoom is between 0 and 21.
+  if ($form_state['values']['store_locator_map_zoom'] > 21 ||
+    $form_state['values']['store_locator_map_zoom'] < 0) {
+    form_set_error('store_locator_map_zoom',
+      t('Please enter a zoom level between 0 and 21.'));
+  }
+
+  // Restrict latitude to 180 degrees and longitude to 360 degrees.
+  if ($form_state['values']['store_locator_map_long'] > 180 ||
+    $form_state['values']['store_locator_map_long'] < -180) {
+    form_set_error('store_locator_map_long',
+      t('Please enter a longitude between -180 and 180'));
+  }
+  if ($form_state['values']['store_locator_map_lat'] > 90 ||
+    $form_state['values']['store_locator_map_lat'] < -90) {
+    form_set_error('store_locator_map_lat',
+      t('Please enter a latitude between -90 and 90'));
+  }
+}
